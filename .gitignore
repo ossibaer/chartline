@@ -1,0 +1,7 @@
+.cache/
+data/
+.env
+chartline
+chartline.exe
+*.log
+
