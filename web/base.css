@@ -1,0 +1,12 @@
+:root { color-scheme: light; --paper: #f5f3ec; --white: #fdfef9; --ink: #272d24; --muted: #828777; --line: #dedfd4; --orange: #cf704a; --lime: #d9ed91; --lavender: #ded3e8; font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Arial, sans-serif; color: var(--ink); background: var(--paper); font-synthesis: none; }
+*, *:before, *:after { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+button, input, select, textarea { font: inherit; }
+button { color: inherit; }
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid #809350; outline-offset: 4px; }
+button[hidden], [hidden] { display: none !important; }
+svg { flex-shrink: 0; vertical-align: middle; }
+h1, h2, h3 { font-weight: 700; }
+::selection { background: #d9ed91; color: #272d24; }
+.muted { color: var(--muted); }.small { font-size: 11px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
