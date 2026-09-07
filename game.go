@@ -9,8 +9,6 @@ import (
 	"time"
 )
 
-const maxPlayers = 10
-
 type track struct {
 	ID       string  `json:"id"`
 	Title    string  `json:"title"`
@@ -34,32 +32,93 @@ type player struct {
 	ID              string
 	Name            string
 	DiscordID       string
-	Cards           []card
+	Team            string
 	Client          *client
 	ReadyGeneration int
 }
 
+// Each color shares one timeline; a player without a color has their own.
+type timeline struct {
+	ID      string
+	Team    string
+	Members []*player
+	Cards   []card
+	Tokens  int
+}
+
+func (t *timeline) includes(p *player) bool {
+	for _, member := range t.Members {
+		if member.ID == p.ID {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *timeline) online() bool {
+	for _, p := range t.Members {
+		if p.Client != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func teamName(color string) string {
+	switch color {
+	case "blue":
+		return "Blue team"
+	case "red":
+		return "Red team"
+	case "green":
+		return "Green team"
+	case "yellow":
+		return "Yellow team"
+	}
+	return ""
+}
+
 type round struct {
-	ID           string
-	Track        track
-	Number       int
-	Generation   int
-	StartAt      int64
-	PrepareUntil time.Time
-	Result       *resultView
+	ID            string
+	Track         track
+	Number        int
+	Generation    int
+	StartAt       int64
+	PrepareUntil  time.Time
+	Result        *resultView
+	Locked        *lockedGuess
+	StealUntil    time.Time
+	StealEligible []string
+	Steals        []stealView
+	Passed        []string
+}
+
+type lockedGuess struct {
+	PlayerID string
+	Position int
+	Artist   string
+	Title    string
+}
+
+type stealView struct {
+	TimelineID string `json:"timelineId"`
+	Position   int    `json:"position"`
 }
 
 type resultView struct {
-	Card     card   `json:"card"`
-	Correct  bool   `json:"correct"`
-	Skipped  bool   `json:"skipped"`
-	PlayerID string `json:"playerId"`
+	Card        card   `json:"card"`
+	Correct     bool   `json:"correct"`
+	Skipped     bool   `json:"skipped"`
+	PlayerID    string `json:"playerId"`
+	AwardedTo   string `json:"awardedTo,omitempty"`
+	TokenEarned bool   `json:"tokenEarned"`
 }
 
 type room struct {
 	Code         string
 	HostID       string
 	Players      []*player
+	Timelines    []*timeline
 	Phase        string
 	Library      string
 	Target       int
@@ -113,19 +172,70 @@ func (r *room) findPlayer(id string) *player {
 	return nil
 }
 
+func (r *room) lobbyTimelines() []*timeline {
+	timelines := []*timeline{}
+	teams := map[string]*timeline{}
+	for _, p := range r.Players {
+		if p.Team == "" {
+			timelines = append(timelines, &timeline{ID: p.ID, Members: []*player{p}})
+			continue
+		}
+		t := teams[p.Team]
+		if t == nil {
+			t = &timeline{ID: "team-" + p.Team, Team: p.Team}
+			teams[p.Team] = t
+			timelines = append(timelines, t)
+		}
+		t.Members = append(t.Members, p)
+	}
+	return timelines
+}
+
+func (r *room) currentTimeline() *timeline {
+	if r.Turn < 0 || r.Turn >= len(r.Timelines) {
+		return nil
+	}
+	return r.Timelines[r.Turn]
+}
+
+func (r *room) isTurn(p *player) bool {
+	t := r.currentTimeline()
+	return t != nil && t.includes(p)
+}
+
+func (r *room) playerTimeline(p *player) *timeline {
+	for _, t := range r.Timelines {
+		if t.includes(p) {
+			return t
+		}
+	}
+	return nil
+}
+
 func (r *room) start(tracks []track, now time.Time) error {
 	if r.Phase != "lobby" {
 		return errors.New("This game has already started.")
 	}
-	if len(tracks) < len(r.Players)+1 {
-		return fmt.Errorf("Add at least %d tracks: one starting card per player, plus a song to guess.", len(r.Players)+1)
+	timelines := r.lobbyTimelines()
+	if len(timelines) == 0 {
+		return errors.New("At least one player must join before starting.")
 	}
+	if len(tracks) < len(timelines)+1 {
+		return fmt.Errorf("Add at least %d tracks: one starting card per team or solo player, plus a song to guess.", len(timelines)+1)
+	}
+	r.Timelines = timelines
 	r.Deck = append([]track(nil), tracks...)
 	shuffle(r.Deck)
-	for _, p := range r.Players {
-		p.Cards = []card{r.draw().card()}
+	for _, t := range r.Timelines {
+		t.Cards = []card{r.draw().card()}
 	}
 	r.Turn = 0
+	for i, t := range r.Timelines {
+		if t.online() {
+			r.Turn = i
+			break
+		}
+	}
 	r.Played = 0
 	r.Winners = nil
 	r.FinishReason = ""
@@ -184,26 +294,34 @@ func validPlacement(cards []card, year, position int) bool {
 }
 
 func (r *room) place(p *player, position int, now time.Time) error {
-	if r.Phase != "playing" || r.Players[r.Turn].ID != p.ID {
+	return r.lockGuess(p, position, "", "", now)
+}
+
+func (r *room) lockGuess(p *player, position int, artist, title string, now time.Time) error {
+	if r.Phase != "playing" || !r.isTurn(p) {
 		return errors.New("It is not your turn to place a song.")
 	}
 	if r.Round.StartAt == 0 || now.UnixMilli() < r.Round.StartAt {
 		return errors.New("Wait for the song to start.")
 	}
-	if position < 0 || position > len(p.Cards) {
+	t := r.currentTimeline()
+	if position < 0 || position > len(t.Cards) {
 		return errors.New("Choose a gap in the timeline.")
 	}
-	correct := validPlacement(p.Cards, r.Round.Track.Year, position)
-	if correct {
-		p.Cards = append(p.Cards, card{})
-		copy(p.Cards[position+1:], p.Cards[position:])
-		p.Cards[position] = r.Round.Track.card()
+	if len([]rune(artist)) > 100 || len([]rune(title)) > 100 {
+		return errors.New("Keep the artist and title to 100 characters each.")
 	}
-	r.Round.Result = &resultView{Card: r.Round.Track.card(), Correct: correct, PlayerID: p.ID}
-	r.Phase = "reveal"
-	if len(p.Cards) >= r.Target {
-		r.Winners = []string{p.ID}
-		r.FinishReason = "The timeline is complete."
+	r.Round.Locked = &lockedGuess{p.ID, position, artist, title}
+	for _, opponent := range r.Timelines {
+		if opponent != t && opponent.Tokens > 0 && opponent.online() {
+			r.Round.StealEligible = append(r.Round.StealEligible, opponent.ID)
+		}
+	}
+	if len(r.Round.StealEligible) == 0 {
+		r.resolveGuess()
+	} else {
+		r.Phase = "stealing"
+		r.Round.StealUntil = now.Add(20 * time.Second)
 	}
 	return nil
 }
@@ -213,9 +331,9 @@ func (r *room) advance(now time.Time) {
 		r.Phase = "finished"
 		return
 	}
-	for range r.Players {
-		r.Turn = (r.Turn + 1) % len(r.Players)
-		if r.Players[r.Turn].Client != nil {
+	for range r.Timelines {
+		r.Turn = (r.Turn + 1) % len(r.Timelines)
+		if r.Timelines[r.Turn].online() {
 			break
 		}
 	}
@@ -227,12 +345,12 @@ func (r *room) finish(reason string) {
 	r.FinishReason = reason
 	best := 0
 	r.Winners = nil
-	for _, p := range r.Players {
-		if len(p.Cards) > best {
-			best = len(p.Cards)
-			r.Winners = []string{p.ID}
-		} else if len(p.Cards) == best {
-			r.Winners = append(r.Winners, p.ID)
+	for _, t := range r.Timelines {
+		if len(t.Cards) > best {
+			best = len(t.Cards)
+			r.Winners = []string{t.ID}
+		} else if len(t.Cards) == best {
+			r.Winners = append(r.Winners, t.ID)
 		}
 	}
 }
@@ -240,48 +358,87 @@ func (r *room) finish(reason string) {
 type playerView struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
-	Cards  []card `json:"cards"`
+	Team   string `json:"team"`
 	Online bool   `json:"online"`
 	Ready  bool   `json:"ready"`
 }
 
+type timelineView struct {
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	Team      string   `json:"team"`
+	PlayerIDs []string `json:"playerIds"`
+	Cards     []card   `json:"cards"`
+	Online    bool     `json:"online"`
+	Tokens    int      `json:"tokens"`
+}
+
 type roundView struct {
-	ID         string      `json:"id"`
-	Number     int         `json:"number"`
-	Generation int         `json:"generation"`
-	StartAt    int64       `json:"startAt"`
-	Offset     float64     `json:"offset"`
-	Duration   float64     `json:"duration"`
-	Result     *resultView `json:"result,omitempty"`
+	ID             string      `json:"id"`
+	Number         int         `json:"number"`
+	Generation     int         `json:"generation"`
+	StartAt        int64       `json:"startAt"`
+	Offset         float64     `json:"offset"`
+	Duration       float64     `json:"duration"`
+	Result         *resultView `json:"result,omitempty"`
+	LockedPosition *int        `json:"lockedPosition,omitempty"`
+	StealUntil     int64       `json:"stealUntil,omitempty"`
+	StealEligible  []string    `json:"stealEligible"`
+	Steals         []stealView `json:"steals"`
+	Passed         []string    `json:"passed"`
 }
 
 type roomView struct {
-	Code         string       `json:"code"`
-	HostID       string       `json:"hostId"`
-	Players      []playerView `json:"players"`
-	Phase        string       `json:"phase"`
-	Library      string       `json:"library"`
-	Target       int          `json:"target"`
-	TurnID       string       `json:"turnId"`
-	Round        *roundView   `json:"round,omitempty"`
-	TrackCount   int          `json:"trackCount"`
-	Remaining    int          `json:"remaining"`
-	Winners      []string     `json:"winners"`
-	FinishReason string       `json:"finishReason"`
+	Code         string         `json:"code"`
+	HostID       string         `json:"hostId"`
+	Players      []playerView   `json:"players"`
+	Timelines    []timelineView `json:"timelines"`
+	Phase        string         `json:"phase"`
+	Library      string         `json:"library"`
+	Target       int            `json:"target"`
+	TurnID       string         `json:"turnId"`
+	Round        *roundView     `json:"round,omitempty"`
+	TrackCount   int            `json:"trackCount"`
+	Remaining    int            `json:"remaining"`
+	Winners      []string       `json:"winners"`
+	FinishReason string         `json:"finishReason"`
 }
 
 func (r *room) view(trackCount int) roomView {
 	v := roomView{Code: r.Code, HostID: r.HostID, Phase: r.Phase, Library: r.Library, Target: r.Target, TrackCount: trackCount, Remaining: len(r.Deck), Winners: r.Winners, FinishReason: r.FinishReason, Players: []playerView{}}
 	for _, p := range r.Players {
-		cards := append([]card{}, p.Cards...)
-		v.Players = append(v.Players, playerView{p.ID, p.Name, cards, p.Client != nil, r.Round != nil && p.ReadyGeneration == r.Round.Generation})
+		v.Players = append(v.Players, playerView{p.ID, p.Name, p.Team, p.Client != nil, r.Round != nil && p.ReadyGeneration == r.Round.Generation})
 	}
-	if len(r.Players) > 0 {
-		v.TurnID = r.Players[r.Turn].ID
+	timelines := r.Timelines
+	if r.Phase == "lobby" {
+		timelines = r.lobbyTimelines()
+	}
+	v.Timelines = []timelineView{}
+	for _, t := range timelines {
+		name := teamName(t.Team)
+		if t.Team == "" {
+			name = t.Members[0].Name
+		}
+		ids := []string{}
+		for _, p := range t.Members {
+			ids = append(ids, p.ID)
+		}
+		v.Timelines = append(v.Timelines, timelineView{t.ID, name, t.Team, ids, append([]card{}, t.Cards...), t.online(), t.Tokens})
+	}
+	if t := r.currentTimeline(); t != nil && r.Phase != "lobby" {
+		v.TurnID = t.ID
 	}
 	if r.Round != nil {
 		q := r.Round
-		v.Round = &roundView{q.ID, q.Number, q.Generation, q.StartAt, q.Track.Start, q.Track.Duration, q.Result}
+		v.Round = &roundView{ID: q.ID, Number: q.Number, Generation: q.Generation, StartAt: q.StartAt, Offset: q.Track.Start, Duration: q.Track.Duration, Result: q.Result,
+			StealEligible: append([]string{}, q.StealEligible...), Steals: append([]stealView{}, q.Steals...), Passed: append([]string{}, q.Passed...)}
+		if q.Locked != nil {
+			position := q.Locked.Position
+			v.Round.LockedPosition = &position
+		}
+		if !q.StealUntil.IsZero() {
+			v.Round.StealUntil = q.StealUntil.UnixMilli()
+		}
 	}
 	return v
 }

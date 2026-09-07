@@ -154,11 +154,7 @@ func (a *app) discordJoin(w http.ResponseWriter, r *http.Request) {
 			fail(w, 409, "The game is in progress. Reopen the Activity when the host returns to the lobby.")
 			return
 		}
-		if len(game.Players) >= maxPlayers {
-			fail(w, 409, "This room already has 10 players.")
-			return
-		}
-		p = &player{ID: newID(), Name: identity.Name, DiscordID: identity.UserID, Cards: []card{}}
+		p = &player{ID: newID(), Name: identity.Name, DiscordID: identity.UserID}
 		game.Players = append(game.Players, p)
 		if game.HostID == "" {
 			game.HostID = p.ID

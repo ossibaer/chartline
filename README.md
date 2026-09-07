@@ -1,6 +1,6 @@
 # Chartline
 
-A private music timeline game for 1–10 players. Go serves the game, WebSocket rooms and local MP3 library; the frontend uses browser JavaScript with no Node build step.
+A private music timeline game with no fixed player limit. Play solo or form up to four teams: blue, red, green, and yellow. Go serves the game, WebSocket rooms and local MP3 library; the frontend uses browser JavaScript with no Node build step.
 
 ## Run
 
@@ -12,17 +12,23 @@ go run .
 
 Open **http://localhost:8080**. Create a room and choose the demo to try it immediately. Open another browser tab and join using the room code to test multiplayer. Each tab has its own player session.
 
-For real songs, open **Manage MP3s** in the lobby, upload songs with their artist, release year and optional clip start, then choose **Your MP3s** as the song library. The game plays up to 20 seconds per song. You need at least one starting card per player plus one song to guess. A larger collection makes a longer game possible.
+For real songs, open **Manage MP3s** in the lobby, upload songs with their artist, release year and optional clip start, then choose **Your MP3s** as the song library. The game plays up to 20 seconds per song. You need at least one starting card per team or solo player plus one song to guess. A larger collection makes a longer game possible.
 
 The 24 built-in demo tracks are original synthesized practice loops with **fictional years**, intended to demonstrate the rules rather than test music knowledge.
 
 ## Playing
 
-- Everyone starts with one revealed song card. On your turn, listen and click a gap in your timeline, then **Lock it in**.
+- Choose **Blue**, **Red**, **Green**, or **Yellow** in the lobby to join that team. Players who keep **Solo** selected play individually. Teams can have any number of players, and solo players can play alongside teams. Change your choice until the host starts the game.
+- Each team or solo player starts with one revealed song card and gets one turn per cycle. On your turn, listen and click a gap in your timeline, then **Lock it in**. Teams share their timeline; any teammate can submit, and the first submission counts.
 - Correct guesses add the card; incorrect guesses do not. Either side of a song from the same year counts.
-- First to 5, 7 or 10 cards wins. If the deck runs out, the highest card count wins, with shared wins for ties.
-- The current player or host can replay for everyone and advance after a reveal. The host can skip broken clips or disconnected players’ turns.
-- Reconnecting preserves your cards. Hosting transfers to an online player when the host disconnects.
+- Each team or solo player starts with zero tokens. Only the playing team can earn one token per song by submitting both the artist and title with its placement. The token is awarded even if the card is misplaced or stolen; leaving either field blank earns none.
+- Artist and title must each match at least 80% after removing whitespace and ignoring capitalization. Similarity is `1 − edit distance / longer answer length`; inserted, missing, and substituted characters each count as one error. For featured songs, one credited artist is enough. Use `feat.`, `ft.`, or `featuring` in artist or title metadata to identify guest artists; names of bands stay intact.
+- Spend **two tokens** on **New song** during your turn to immediately draw a replacement and keep the turn. If there is no replacement song left, skipping is disabled and tokens are kept.
+- After a placement locks, online opponents with tokens get **20 seconds** to place a **one-token steal** in a different gap on the playing team's timeline, or **Pass** for free. The answer remains hidden until all eligible opponents decide or time expires. Each opponent gets one decision per song; teammates share it.
+- If the playing team is wrong, the first correct steal wins the card, which is inserted in year order into the stealer's own timeline. The playing team keeps the card whenever its placement is correct, including same-year ties. Every placed token is lost, even for failed or later correct steals. A stolen card can win the game.
+- First team or solo player to 5, 7 or 10 cards wins. If the deck runs out, the highest card count wins, with shared wins for ties.
+- Any member of the current team, the current solo player, or the host can replay for everyone and advance after a reveal. The host can end a turn without a guess for broken clips or disconnected players; this awards no card or token and gives up the turn. Turn rotation skips teams with no online members and offline solo players.
+- Reconnecting preserves your team, cards, tokens, and any pending steal decision. Hosting transfers to an online player when the host disconnects. Returning to the lobby keeps online players’ colors and clears cards and tokens for a new game.
 - Click **Enable sound** after reloading the page. Everyone plays the audio locally; the server coordinates readiness and a shared start time.
 
 ## Private hosting
@@ -67,6 +73,8 @@ go build .
 
 Web assets are embedded at compilation: restart `go run .` after editing frontend files. `game.go` owns rules and public snapshots; `server.go` owns rooms, WebSockets and media access; `library.go` owns MP3 storage and demo synthesis; `discord.go` and `web/platform.js` isolate Discord integration; `web/audio.js` coordinates local audio playback.
 
-Tests cover placements and same-year ties, turn authorization, stale actions, wins, deck exhaustion, two-client synchronization, answer hiding, audio access, host transfer, reconnects, room limits, MP3 validation/persistence and Discord ticket/instance handling.
+Tests cover placements and same-year ties, team selection and shared timelines, turn authorization, stale actions, team and solo wins, deck exhaustion, multi-client synchronization, answer hiding, audio access, host transfer, reconnects, browser and Discord rooms above ten players, MP3 validation/persistence and Discord ticket/instance handling.
+
+Token tests cover the 80% recognition boundary, whitespace/case handling, featured artists, earning on misplaced cards, skip costs and empty decks, competing steals, same-year priority, sorted stolen cards, steal wins, deadlines, passes, duplicate/stale actions, hidden answers, and reconnecting during a steal window.
 
 Current draft limits: no mid-game joins, no persistent game history, no library deletion UI, and no song recognition or release-year lookup. Players can inspect audio or use recognition tools; this is a game for trusted friends.

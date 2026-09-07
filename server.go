@@ -139,7 +139,7 @@ func (a *app) config(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	count := len(a.library)
 	a.mu.Unlock()
-	writeJSON(w, 200, map[string]any{"maxPlayers": maxPlayers, "customTrackCount": count, "demoTrackCount": len(a.demos), "accessKeyRequired": a.accessKey != "", "discordClientId": a.discord.ClientID, "discordEnabled": a.discord.ClientID != "" && a.discord.Secret != ""})
+	writeJSON(w, 200, map[string]any{"customTrackCount": count, "demoTrackCount": len(a.demos), "accessKeyRequired": a.accessKey != "", "discordClientId": a.discord.ClientID, "discordEnabled": a.discord.ClientID != "" && a.discord.Secret != ""})
 }
 
 type entryRequest struct {
@@ -194,12 +194,8 @@ func (a *app) enter(w http.ResponseWriter, r *http.Request, create bool) {
 			fail(w, 409, "This game is in progress. Join when the host returns to the lobby.")
 			return
 		}
-		if len(game.Players) >= maxPlayers {
-			fail(w, 409, "This room already has 10 players.")
-			return
-		}
 	}
-	p := &player{ID: newID(), Name: input.Name, Cards: []card{}}
+	p := &player{ID: newID(), Name: input.Name}
 	game.Players = append(game.Players, p)
 	if game.HostID == "" {
 		game.HostID = p.ID
@@ -304,6 +300,9 @@ type action struct {
 	Generation int    `json:"generation,omitempty"`
 	Library    string `json:"library,omitempty"`
 	Target     int    `json:"target,omitempty"`
+	Team       string `json:"team"`
+	Artist     string `json:"artist,omitempty"`
+	Title      string `json:"title,omitempty"`
 	ClientTime int64  `json:"clientTime,omitempty"`
 }
 
@@ -412,12 +411,20 @@ func (a *app) socket(w http.ResponseWriter, r *http.Request) {
 
 func (a *app) applyAction(r *room, p *player, m action, now time.Time) error {
 	host := p.ID == r.HostID
-	if m.Type == "ready" || m.Type == "place" || m.Type == "replay" || m.Type == "skip" || m.Type == "next" {
+	if m.Type == "ready" || m.Type == "place" || m.Type == "replay" || m.Type == "skip" || m.Type == "discard" || m.Type == "steal" || m.Type == "pass" || m.Type == "next" {
 		if r.Round == nil || r.Round.ID != m.RoundID {
 			return errors.New("The round changed. Try again.")
 		}
 	}
 	switch m.Type {
+	case "team":
+		if r.Phase != "lobby" {
+			return errors.New("Choose your team in the lobby before the game starts.")
+		}
+		if m.Team != "" && teamName(m.Team) == "" {
+			return errors.New("Choose blue, red, green, yellow, or solo.")
+		}
+		p.Team = m.Team
 	case "settings":
 		if !host || r.Phase != "lobby" {
 			return errors.New("Only the host can change lobby settings.")
@@ -442,24 +449,28 @@ func (a *app) applyAction(r *room, p *player, m action, now time.Time) error {
 		p.ReadyGeneration = m.Generation
 		r.schedule(now)
 	case "place":
-		return r.place(p, m.Position, now)
+		return r.lockGuess(p, m.Position, m.Artist, m.Title, now)
+	case "steal", "pass":
+		return r.steal(p, m.Position, m.Type == "pass", now)
 	case "replay":
-		if r.Phase != "playing" || (!host && p.ID != r.Players[r.Turn].ID) {
-			return errors.New("Only the host or current player can replay.")
+		if r.Phase != "playing" || (!host && !r.isTurn(p)) {
+			return errors.New("Only the host or someone on the current timeline can replay.")
 		}
 		if r.Round.StartAt == 0 {
 			return errors.New("The clip is already loading.")
 		}
 		r.prepare(now)
 	case "skip":
+		return r.skipWithTokens(p, now)
+	case "discard":
 		if !host || r.Phase != "playing" {
-			return errors.New("Only the host can skip this song.")
+			return errors.New("Only the host can end this turn without a guess.")
 		}
-		r.Round.Result = &resultView{Card: r.Round.Track.card(), Skipped: true, PlayerID: r.Players[r.Turn].ID}
+		r.Round.Result = &resultView{Card: r.Round.Track.card(), Skipped: true, PlayerID: p.ID}
 		r.Phase = "reveal"
 	case "next":
-		if r.Phase != "reveal" || (!host && p.ID != r.Players[r.Turn].ID) {
-			return errors.New("Wait for the host or current player to continue.")
+		if r.Phase != "reveal" || (!host && !r.isTurn(p)) {
+			return errors.New("Wait for the host or someone on the current timeline to continue.")
 		}
 		r.advance(now)
 	case "reset":
@@ -469,7 +480,6 @@ func (a *app) applyAction(r *room, p *player, m action, now time.Time) error {
 		players := []*player{}
 		for _, member := range r.Players {
 			if member.Client != nil {
-				member.Cards = []card{}
 				players = append(players, member)
 			} else {
 				for token, s := range a.sessions {
@@ -480,6 +490,7 @@ func (a *app) applyAction(r *room, p *player, m action, now time.Time) error {
 			}
 		}
 		r.Players = players
+		r.Timelines = nil
 		r.Phase = "lobby"
 		r.Round = nil
 		r.Deck = nil
@@ -502,7 +513,7 @@ func (a *app) runClock(ctx context.Context) {
 		case now := <-ticker.C:
 			a.mu.Lock()
 			for code, r := range a.rooms {
-				if r.schedule(now) {
+				if r.schedule(now) || r.resolveSteals(now) {
 					a.broadcast(r)
 				}
 				if now.Sub(r.Updated) > 12*time.Hour {
@@ -668,7 +679,7 @@ func (a *app) audio(w http.ResponseWriter, r *http.Request) {
 		fail(w, 401, "Your session has expired.")
 		return
 	}
-	if game.Round == nil || game.Round.ID != r.PathValue("round") || (game.Phase != "playing" && game.Phase != "reveal") {
+	if game.Round == nil || game.Round.ID != r.PathValue("round") || (game.Phase != "playing" && game.Phase != "stealing" && game.Phase != "reveal") {
 		a.mu.Unlock()
 		fail(w, 404, "This clip is no longer available.")
 		return

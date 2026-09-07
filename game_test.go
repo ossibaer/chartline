@@ -41,9 +41,11 @@ func TestChronologicalPlacement(t *testing.T) {
 
 func TestGameOutcomeAndStaleActions(t *testing.T) {
 	a := &app{}
-	p := &player{ID: "a", Cards: []card{{Year: 1960}, {Year: 1980}, {Year: 1990}, {Year: 2000}}}
-	q := &player{ID: "b", Cards: []card{{Year: 1975}}}
-	r := &room{HostID: p.ID, Players: []*player{p, q}, Phase: "playing", Target: 5, Round: &round{ID: "round-one", Track: track{Title: "Secret", Year: 1970}, StartAt: time.Now().Add(-time.Second).UnixMilli()}}
+	p := &player{ID: "a"}
+	q := &player{ID: "b"}
+	first := &timeline{ID: p.ID, Members: []*player{p}, Cards: []card{{Year: 1960}, {Year: 1980}, {Year: 1990}, {Year: 2000}}}
+	second := &timeline{ID: q.ID, Members: []*player{q}, Cards: []card{{Year: 1975}}}
+	r := &room{HostID: p.ID, Players: []*player{p, q}, Timelines: []*timeline{first, second}, Phase: "playing", Target: 5, Round: &round{ID: "round-one", Track: track{Title: "Secret", Year: 1970}, StartAt: time.Now().Add(-time.Second).UnixMilli()}}
 	if err := a.applyAction(r, q, action{Type: "place", RoundID: r.Round.ID, Position: 0}, time.Now()); err == nil {
 		t.Fatal("another player was allowed to place")
 	}
@@ -53,10 +55,10 @@ func TestGameOutcomeAndStaleActions(t *testing.T) {
 	if err := a.applyAction(r, p, action{Type: "place", RoundID: r.Round.ID, Position: 1}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if r.Phase != "reveal" || !r.Round.Result.Correct || len(p.Cards) != 5 || len(r.Winners) != 1 {
+	if r.Phase != "reveal" || !r.Round.Result.Correct || len(first.Cards) != 5 || len(r.Winners) != 1 {
 		t.Fatalf("bad winning reveal: %+v", r)
 	}
-	if !sort.SliceIsSorted(p.Cards, func(i, j int) bool { return p.Cards[i].Year < p.Cards[j].Year }) {
+	if !sort.SliceIsSorted(first.Cards, func(i, j int) bool { return first.Cards[i].Year < first.Cards[j].Year }) {
 		t.Fatal("timeline was not sorted")
 	}
 	if err := a.applyAction(r, p, action{Type: "place", RoundID: r.Round.ID, Position: 1}, time.Now()); err == nil {
@@ -76,10 +78,10 @@ func TestGameOutcomeAndStaleActions(t *testing.T) {
 	if err := r.place(p, 0, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if r.Round.Result.Correct || len(p.Cards) != 5 {
+	if r.Round.Result.Correct || len(first.Cards) != 5 {
 		t.Fatal("incorrect guess awarded a card")
 	}
-	q.Cards = append([]card{}, p.Cards...)
+	second.Cards = append([]card{}, first.Cards...)
 	r.advance(time.Now())
 	if r.Phase != "finished" || len(r.Winners) != 2 {
 		t.Fatal("deck exhaustion should share tied wins")
@@ -239,12 +241,12 @@ func TestLiveRoomAudioAndReconnect(t *testing.T) {
 	}
 	time.Sleep(time.Until(time.UnixMilli(scheduled.Room.Round.StartAt)) + 10*time.Millisecond)
 	position := 0
-	for position < len(scheduled.Room.Players[0].Cards) && scheduled.Room.Players[0].Cards[position].Year < hidden.Year {
+	for position < len(scheduled.Room.Timelines[0].Cards) && scheduled.Room.Timelines[0].Cards[position].Year < hidden.Year {
 		position++
 	}
 	writeAction(t, c1, action{Type: "place", RoundID: roundID, Position: position})
 	reveal := readUntil(t, c2, func(m wireMessage) bool { return m.Type == "state" && m.Room.Phase == "reveal" })
-	if !reveal.Room.Round.Result.Correct || reveal.Room.Round.Result.Card.Title != hidden.Title || len(reveal.Room.Players[0].Cards) != 2 {
+	if !reveal.Room.Round.Result.Correct || reveal.Room.Round.Result.Card.Title != hidden.Title || len(reveal.Room.Timelines[0].Cards) != 2 {
 		t.Fatal("clients did not see a correct reveal")
 	}
 	writeAction(t, c1, action{Type: "next", RoundID: roundID})
@@ -259,7 +261,7 @@ func TestLiveRoomAudioAndReconnect(t *testing.T) {
 	readUntil(t, c2, func(m wireMessage) bool { return m.Type == "state" && m.Room.HostID == guest.PlayerID })
 	reconnected := connectTest(t, s, host)
 	restored := readUntil(t, reconnected, func(m wireMessage) bool { return m.Type == "state" })
-	if len(restored.Room.Players) != 2 || len(restored.Room.Players[0].Cards) != 2 || restored.Room.HostID != guest.PlayerID {
+	if len(restored.Room.Players) != 2 || len(restored.Room.Timelines[0].Cards) != 2 || restored.Room.HostID != guest.PlayerID {
 		t.Fatal("reconnect did not preserve player state and host transfer")
 	}
 }
@@ -272,11 +274,19 @@ func TestPrivateAccessCapacityAndAssets(t *testing.T) {
 	var host entry
 	_ = json.Unmarshal(data, &host)
 	apiTest(t, s, "/api/join", "", entryRequest{Name: "Stranger", Code: host.Code}, 403)
-	for i := 1; i < 10; i++ {
+	for i := 1; i < 30; i++ {
 		apiTest(t, s, "/api/join", "", entryRequest{Name: fmt.Sprintf("Friend %d", i), Code: host.Code, AccessKey: "friends-only"}, 201)
 	}
-	apiTest(t, s, "/api/join", "", entryRequest{Name: "Eleventh", Code: host.Code, AccessKey: "friends-only"}, 409)
-	apiTest(t, s, "/.proxy/api/config", "", nil, 200)
+	config := apiTest(t, s, "/.proxy/api/config", "", nil, 200)
+	if bytes.Contains(config, []byte("maxPlayers")) {
+		t.Fatal("config still advertises a player limit")
+	}
+	a.mu.Lock()
+	count := len(a.rooms[host.Code].Players)
+	a.mu.Unlock()
+	if count != 30 {
+		t.Fatalf("got %d players; want 30", count)
+	}
 	for _, path := range []string{"/data/library.json", "/.env", "/server.go"} {
 		apiTest(t, s, path, "", nil, 404)
 	}
@@ -370,6 +380,11 @@ func TestDiscordTicketsAndIsolation(t *testing.T) {
 	third := login("Alice", "instance-two")
 	if first.Code != second.Code || first.Code == third.Code {
 		t.Fatal("Discord instance routing was incorrect")
+	}
+	for i := 0; i < 28; i++ {
+		if joined := login(fmt.Sprintf("Friend%d", i), "instance-one"); joined.Code != first.Code {
+			t.Fatal("Discord join above the old player limit did not use the same room")
+		}
 	}
 	again := login("Alice", "instance-one")
 	if again.PlayerID != first.PlayerID {
