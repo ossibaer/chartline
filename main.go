@@ -42,7 +42,7 @@ func main() {
 		_ = server.Shutdown(shutdown)
 	}()
 	log.Printf("Chartline is ready at http://%s", server.Addr)
-	log.Print("MP3s are saved locally. Rooms reset when the server restarts.")
+	log.Printf("Loaded %d songs from %s/audio. Rooms reset when the server restarts.", len(app.library), app.dataDir)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}

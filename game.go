@@ -10,14 +10,12 @@ import (
 )
 
 type track struct {
-	ID       string  `json:"id"`
-	Title    string  `json:"title"`
-	Artist   string  `json:"artist"`
-	Year     int     `json:"year"`
-	File     string  `json:"file,omitempty"`
-	Start    float64 `json:"start"`
-	Duration float64 `json:"duration"`
-	Demo     int     `json:"demo,omitempty"`
+	ID     string  `json:"id"`
+	Title  string  `json:"title"`
+	Artist string  `json:"artist"`
+	Year   int     `json:"year"`
+	File   string  `json:"file,omitempty"`
+	Start  float64 `json:"start"`
 }
 
 type card struct {
@@ -120,7 +118,6 @@ type room struct {
 	Players      []*player
 	Timelines    []*timeline
 	Phase        string
-	Library      string
 	Target       int
 	Turn         int
 	Deck         []track
@@ -221,7 +218,7 @@ func (r *room) start(tracks []track, now time.Time) error {
 		return errors.New("At least one player must join before starting.")
 	}
 	if len(tracks) < len(timelines)+1 {
-		return fmt.Errorf("Add at least %d tracks: one starting card per team or solo player, plus a song to guess.", len(timelines)+1)
+		return fmt.Errorf("This game needs at least %d songs: one starting card per team or solo player, plus a song to guess.", len(timelines)+1)
 	}
 	r.Timelines = timelines
 	r.Deck = append([]track(nil), tracks...)
@@ -379,7 +376,6 @@ type roundView struct {
 	Generation     int         `json:"generation"`
 	StartAt        int64       `json:"startAt"`
 	Offset         float64     `json:"offset"`
-	Duration       float64     `json:"duration"`
 	Result         *resultView `json:"result,omitempty"`
 	LockedPosition *int        `json:"lockedPosition,omitempty"`
 	StealUntil     int64       `json:"stealUntil,omitempty"`
@@ -394,7 +390,6 @@ type roomView struct {
 	Players      []playerView   `json:"players"`
 	Timelines    []timelineView `json:"timelines"`
 	Phase        string         `json:"phase"`
-	Library      string         `json:"library"`
 	Target       int            `json:"target"`
 	TurnID       string         `json:"turnId"`
 	Round        *roundView     `json:"round,omitempty"`
@@ -405,7 +400,7 @@ type roomView struct {
 }
 
 func (r *room) view(trackCount int) roomView {
-	v := roomView{Code: r.Code, HostID: r.HostID, Phase: r.Phase, Library: r.Library, Target: r.Target, TrackCount: trackCount, Remaining: len(r.Deck), Winners: r.Winners, FinishReason: r.FinishReason, Players: []playerView{}}
+	v := roomView{Code: r.Code, HostID: r.HostID, Phase: r.Phase, Target: r.Target, TrackCount: trackCount, Remaining: len(r.Deck), Winners: r.Winners, FinishReason: r.FinishReason, Players: []playerView{}}
 	for _, p := range r.Players {
 		v.Players = append(v.Players, playerView{p.ID, p.Name, p.Team, p.Client != nil, r.Round != nil && p.ReadyGeneration == r.Round.Generation})
 	}
@@ -430,7 +425,7 @@ func (r *room) view(trackCount int) roomView {
 	}
 	if r.Round != nil {
 		q := r.Round
-		v.Round = &roundView{ID: q.ID, Number: q.Number, Generation: q.Generation, StartAt: q.StartAt, Offset: q.Track.Start, Duration: q.Track.Duration, Result: q.Result,
+		v.Round = &roundView{ID: q.ID, Number: q.Number, Generation: q.Generation, StartAt: q.StartAt, Offset: q.Track.Start, Result: q.Result,
 			StealEligible: append([]string{}, q.StealEligible...), Steals: append([]stealView{}, q.Steals...), Passed: append([]string{}, q.Passed...)}
 		if q.Locked != nil {
 			position := q.Locked.Position

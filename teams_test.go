@@ -76,15 +76,15 @@ func TestTeamSelectionAndStartingDeal(t *testing.T) {
 
 func TestTeamTurnsPermissionsAndOfflineMembers(t *testing.T) {
 	now := time.Now()
-	a := &app{demos: demoLibrary()}
+	a := &app{library: testTracks()}
 	blue1 := &player{ID: "blue1", Team: "blue"}
 	red := &player{ID: "red1", Team: "red", Client: &client{}}
 	blue2 := &player{ID: "blue2", Team: "blue", Client: &client{}}
 	solo := &player{ID: "solo", Client: &client{}}
 	offlineSolo := &player{ID: "offline-solo"}
 	green := &player{ID: "green1", Team: "green"}
-	r := &room{HostID: solo.ID, Phase: "lobby", Library: "demo", Target: 10, Players: []*player{blue1, red, blue2, solo, offlineSolo, green}}
-	if err := r.start(a.demos, now); err != nil {
+	r := &room{HostID: solo.ID, Phase: "lobby", Target: 10, Players: []*player{blue1, red, blue2, solo, offlineSolo, green}}
+	if err := r.start(a.library, now); err != nil {
 		t.Fatal(err)
 	}
 	if r.currentTimeline().ID != "team-blue" || !r.isTurn(blue2) || r.isTurn(red) {
@@ -140,13 +140,13 @@ func TestTeamTurnsPermissionsAndOfflineMembers(t *testing.T) {
 
 func TestTeamWinsTiesAndReset(t *testing.T) {
 	now := time.Now()
-	a := &app{demos: demoLibrary(), sessions: map[string]session{"offline-token": {Room: "room", Player: "offline"}}}
+	a := &app{library: testTracks(), sessions: map[string]session{"offline-token": {Room: "room", Player: "offline"}}}
 	p := &player{ID: "a", Team: "yellow", Client: &client{}}
 	q := &player{ID: "b", Team: "yellow", Client: &client{}}
 	solo := &player{ID: "solo", Client: &client{}}
 	offline := &player{ID: "offline", Team: "yellow"}
 	r := &room{HostID: p.ID, Phase: "lobby", Target: 2, Players: []*player{p, q, solo, offline}}
-	if err := r.start(a.demos, now); err != nil {
+	if err := r.start(a.library, now); err != nil {
 		t.Fatal(err)
 	}
 	r.Round.StartAt = now.Add(-time.Second).UnixMilli()
@@ -171,7 +171,7 @@ func TestTeamWinsTiesAndReset(t *testing.T) {
 	if err := a.applyAction(r, p, action{Type: "reset"}, now); err != nil {
 		t.Fatal(err)
 	}
-	v := r.view(len(a.demos))
+	v := r.view(len(a.library))
 	if len(r.Players) != 3 || len(a.sessions) != 0 || len(r.Timelines) != 0 || v.TurnID != "" || r.Round != nil || len(r.Winners) != 0 {
 		t.Fatal("reset did not clear game state and remove offline players")
 	}
@@ -181,7 +181,7 @@ func TestTeamWinsTiesAndReset(t *testing.T) {
 	if err := a.applyAction(r, q, action{Type: "team", Team: ""}, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.start(a.demos, now); err != nil {
+	if err := r.start(a.library, now); err != nil {
 		t.Fatal(err)
 	}
 	if len(r.Timelines) != 3 || len(r.Timelines[0].Members) != 1 || len(r.Timelines[0].Cards) != 1 {

@@ -46,7 +46,7 @@ func TestFeaturedArtistRecognition(t *testing.T) {
 		{"Lead", "Song Title (feat. Guest)", "Guest", "Song Title", true},
 		{"Lead", "Song Title [ft. Guest]", "Lead", "Song Title [ft. Guest]", true},
 		{"Earth, Wind & Fire", "September", "Earth, Wind & Fire", "September", true},
-		{"Earth, Wind & Fire", "September", "Fire", "September", false},
+		{"Earth, Wind & Fire", "September", "Fire", "September", true},
 		{"AC/DC", "Thunderstruck", "DC", "Thunderstruck", false},
 		{"Lead feat. Guest", "Song Title", "Stranger", "Song Title", false},
 		{"Lead feat. Guest", "Song Title", "Guest", "Wrong Song", false},
@@ -54,6 +54,125 @@ func TestFeaturedArtistRecognition(t *testing.T) {
 		if got := recognizedSong(track{Artist: tt.artist, Title: tt.title}, tt.guessArtist, tt.guessTitle); got != tt.want {
 			t.Errorf("recognition of %q / %q with %q / %q = %v; want %v", tt.artist, tt.title, tt.guessArtist, tt.guessTitle, got, tt.want)
 		}
+	}
+}
+
+func TestArtistSubsets(t *testing.T) {
+	for _, tt := range []struct {
+		guess string
+		want  bool
+	}{
+		{"Alpha", true}, {"Bravo", true}, {"Charlie", true}, {"Delta", true},
+		{"Alphx", true}, {"Alpxx", false},
+		{"Alpha & Charlie", true}, {"Charlie; Alpha", true},
+		{"Alphx, Bravx", true}, {"Alphx, Braxx", false},
+		{"Alpha; Bravo & Charlie, Delta", true},
+		{"Alpha; Bravo & Charlxx, Delta", false},
+		{"Alpha, Stranger", false}, {"Stranger; Alpha", false},
+		{"", false}, {",;&", false},
+	} {
+		t.Run(tt.guess, func(t *testing.T) {
+			track := track{Artist: "Alpha, Bravo & Charlie; Delta", Title: "Song"}
+			if got := recognizedSong(track, tt.guess, "Song"); got != tt.want {
+				t.Fatalf("artist %q: got %v, want %v", tt.guess, got, tt.want)
+			}
+		})
+	}
+	if !recognizedSong(track{Artist: "Alpha, Bravo feat. Charlie & Delta", Title: "Song"}, "Delta; Alpha", "Song") {
+		t.Fatal("could not combine main and featured artists")
+	}
+}
+
+func TestParenthesizedTitles(t *testing.T) {
+	for _, tt := range []struct {
+		title, guess string
+		want         bool
+	}{
+		{"(Optional Words) Main Title", "Main Title", true},
+		{"(Optional Words) Main Title", "Optional Words Main Title", true},
+		{"(Optional Words) Main Title", "(Optional Words) Main Title", true},
+		{"(Optional Words) Main Title", "Optional Words", false},
+		{"Main (Optional Words) Title", "Main Title", true},
+		{"Main (Optional Words) Title", "Main Optional Words Title", true},
+		{"Main (Optional Words) Title", "Main (Optional Words) Title", true},
+		{"Main (Optional Words) Title", "Optional Words", false},
+		{"(A very long optional phrase) X", "A very long optional phrase", false},
+		{"(A very long optional phrase) X", "A very long optional phrasq", false},
+		{"(A very long optional phrase) X", "A very long optional phrasq X", true},
+		{"(A very long optional phrase) X", "(A very long optional phrase) X", true},
+		{"(Dance) Dance", "Dance", true},
+		{"(First optional phrase) X (Second optional phrase) Y", "First optional phrase Second optional phrasx", false},
+		{"Main Title (Alternative Title)", "Main Title", true},
+		{"Main Title (Alternative Title)", "Alternative Title", true},
+		{"Main Title (Alternative Title)", "Main Title (Alternative Title)", true},
+		{"Main Title (Alternative Title)", "Main Title Alternative Title", true},
+		{"Main Title (Alternative Title)  ", "Alternative Title", true},
+		{"(Optional) abcde", "abcdx", true},
+		{"(Optional) abcde", "abcxx", false},
+		{"ab (Optional) cde", "abcdx", true},
+		{"ab (Optional) cde", "abcxx", false},
+		{"abcde (fghij)", "abcdx", true},
+		{"abcde (fghij)", "abcxx", false},
+		{"abcde (fghij)", "fghix", true},
+		{"abcde (fghij)", "fghxx", false},
+		{"(Intro) Main (Middle) Title (Alternative)", "Main Title", true},
+		{"(Intro) Main (Middle) Title (Alternative)", "Intro Main Title", true},
+		{"(Intro) Main (Middle) Title (Alternative)", "Main Middle Title", true},
+		{"(Intro) Main (Middle) Title (Alternative)", "Alternative", true},
+		{"(Intro) Main (Middle) Title (Alternative)", "Middle", false},
+		{"(Optional) Main Title", "", false},
+		{"Main Title ()", "", false},
+		{"Main Title (Alternative Title)", "Unrelated Song", false},
+		{"(Optional) Main Title", "(Optional) Main Titlx", true},
+	} {
+		t.Run(tt.title+"/"+tt.guess, func(t *testing.T) {
+			if got := recognizedSong(track{Artist: "Artist", Title: tt.title}, "Artist", tt.guess); got != tt.want {
+				t.Fatalf("title %q guessed as %q: got %v, want %v", tt.title, tt.guess, got, tt.want)
+			}
+		})
+	}
+	for _, guess := range []string{"Main Title", "Alternative Title", "Main Title (Alternative Title) (feat. Guest)"} {
+		if !recognizedSong(track{Artist: "Lead", Title: "Main Title (Alternative Title) (feat. Guest)"}, "Guest", guess) {
+			t.Errorf("featured credit interfered with title variant %q", guess)
+		}
+	}
+	if recognizedSong(track{Artist: "Lead", Title: "Main Title (feat. Guest)"}, "Lead", "Guest") {
+		t.Fatal("featured artist was treated as an alternative title")
+	}
+}
+
+func TestTitlePartsSimilarity(t *testing.T) {
+	// Compare the merged edit-distance rows with explicitly expanded variants.
+	parts := [][]string{{"ab", "cd", ""}, {"e"}, {"fg", "(fg)", ""}}
+	for _, guess := range []string{"", "e", "abefg", "cde(fg)", "abexg", "abexx", "zabefg", "(fg)", "cdef", "unrelated"} {
+		want := false
+		for _, prefix := range parts[0] {
+			for _, suffix := range parts[2] {
+				want = want || closeGuess(guess, prefix+"e"+suffix)
+			}
+		}
+		if got := closeTitleParts(guess, parts); got != want {
+			t.Errorf("variant similarity for %q: got %v, want %v", guess, got, want)
+		}
+	}
+	if !recognizedTitle("Required", strings.Repeat("(optional) ", 30)+"Required") {
+		t.Fatal("could not omit many optional phrases")
+	}
+}
+
+func TestRelaxedRecognitionAwardsToken(t *testing.T) {
+	for _, guess := range []string{"Main Title", "Alternative Title", "(Intro) Main Title (Alternative Title)"} {
+		t.Run(guess, func(t *testing.T) {
+			a, r, p, _, _, now := tokenGame()
+			r.Round.Track.Artist = "Alpha, Bravo & Charlie"
+			r.Round.Track.Title = "(Intro) Main Title (Alternative Title)"
+			if err := a.applyAction(r, p, action{Type: "place", RoundID: r.Round.ID, Position: 0, Artist: "Charlix; Alphx", Title: guess}, now); err != nil {
+				t.Fatal(err)
+			}
+			if !r.Round.Result.TokenEarned || r.Timelines[0].Tokens != 1 || r.Round.Result.Correct {
+				t.Fatalf("relaxed matching did not award exactly one token on a misplaced card: %+v", r.Round.Result)
+			}
+		})
 	}
 }
 

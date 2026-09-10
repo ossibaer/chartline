@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -94,7 +93,11 @@ func testApp(t *testing.T) (*app, *httptest.Server) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := newApp(t.TempDir(), assets)
+	dir := t.TempDir()
+	for _, song := range testTracks() {
+		writeTestAudio(t, dir, song.File, taggedMP3(3, song.Title, song.Artist, fmt.Sprint(song.Year)))
+	}
+	a, err := newApp(dir, assets)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +155,7 @@ func enterTest(t *testing.T, s *httptest.Server, code, name string) entry {
 	if code != "" {
 		path = "/api/join"
 	}
-	data := apiTest(t, s, path, "", entryRequest{Name: name, Code: code, Library: "demo", Target: 5}, 201)
+	data := apiTest(t, s, path, "", entryRequest{Name: name, Code: code, Target: 5}, 201)
 	var e entry
 	if err := json.Unmarshal(data, &e); err != nil {
 		t.Fatal(err)
@@ -224,11 +227,11 @@ func TestLiveRoomAudioAndReconnect(t *testing.T) {
 		t.Fatal("unrevealed answer leaked into state")
 	}
 	apiTest(t, s, "/api/audio/"+roundID, "", nil, 401)
-	wav := apiTest(t, s, "/api/audio/"+roundID, guest.Token, nil, 200)
-	if string(wav[:4]) != "RIFF" || len(wav) != 44+22050*8*2 {
-		t.Fatal("invalid demo audio")
+	audio := apiTest(t, s, "/api/audio/"+roundID, guest.Token, nil, 200)
+	if !bytes.Equal(audio, testMP3Frames()) {
+		t.Fatal("MP3 audio was changed or metadata was not stripped")
 	}
-	apiTest(t, s, "/api/library", host.Token, nil, 403)
+	apiTest(t, s, "/api/library", host.Token, nil, 404)
 	writeAction(t, c1, action{Type: "ready", RoundID: roundID, Generation: 1})
 	readyOne := readUntil(t, c1, func(m wireMessage) bool { return m.Type == "state" && m.Room.Players[0].Ready })
 	if readyOne.Room.Round.StartAt != 0 {
@@ -300,65 +303,6 @@ func TestPrivateAccessCapacityAndAssets(t *testing.T) {
 	}
 }
 
-func uploadTest(t *testing.T, s *httptest.Server, token string, audio []byte, status int) {
-	t.Helper()
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	for key, value := range map[string]string{"title": "Private title", "artist": "Private artist", "year": "1998", "start": "0"} {
-		if err := writer.WriteField(key, value); err != nil {
-			t.Fatal(err)
-		}
-	}
-	part, err := writer.CreateFormFile("file", "Artist - Secret.mp3")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _ = part.Write(audio)
-	_ = writer.Close()
-	req, _ := http.NewRequest("POST", s.URL+"/api/library", &body)
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	req.Header.Set("Authorization", "Bearer "+token)
-	res, err := s.Client().Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
-	data, _ := io.ReadAll(res.Body)
-	if res.StatusCode != status {
-		t.Fatalf("upload got %d want %d: %s", res.StatusCode, status, data)
-	}
-}
-
-func TestMP3PersistenceAndValidation(t *testing.T) {
-	a, s := testApp(t)
-	host := enterTest(t, s, "", "Host")
-	guest := enterTest(t, s, host.Code, "Guest")
-	uploadTest(t, s, guest.Token, []byte("bad"), 403)
-	uploadTest(t, s, host.Token, []byte("not an MP3"), 400)
-	frame := make([]byte, 417)
-	copy(frame, []byte{0xff, 0xfb, 0x90, 0xc4})
-	// An ID3 tag containing an answer must not remain in the stored audio.
-	tag := append([]byte{'I', 'D', '3', 3, 0, 0, 0, 0, 0, 6}, []byte("Secret")...)
-	uploadTest(t, s, host.Token, append(tag, bytes.Repeat(frame, 80)...), 201)
-	loaded, err := loadLibrary(a.dataDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(loaded) != 1 || loaded[0].Year != 1998 || strings.Contains(loaded[0].File, "Secret") {
-		t.Fatalf("unexpected library: %+v", loaded)
-	}
-	cleaned, err := cleanMP3(append(tag, frame...))
-	if err != nil || bytes.Contains(cleaned, []byte("Secret")) {
-		t.Fatal("ID3 removal failed")
-	}
-	if _, err := cleanMP3([]byte{'I', 'D', '3', 3, 0, 0, 127, 127, 127, 127}); err == nil {
-		t.Fatal("malformed ID3 accepted")
-	}
-	if err := saveLibrary(a.dataDir, loaded); err != nil {
-		t.Fatal("replacing the library failed:", err)
-	}
-}
-
 func TestDiscordTicketsAndIsolation(t *testing.T) {
 	a, s := testApp(t)
 	apiTest(t, s, "/api/discord/token", "", map[string]string{"code": "missing"}, 503)
@@ -390,5 +334,5 @@ func TestDiscordTicketsAndIsolation(t *testing.T) {
 	if again.PlayerID != first.PlayerID {
 		t.Fatal("Discord reconnect created a duplicate player")
 	}
-	apiTest(t, s, "/api/library", first.Token, nil, 401)
+	apiTest(t, s, "/api/audio/missing", first.Token, nil, 401)
 }

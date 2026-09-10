@@ -138,7 +138,7 @@ func (a *app) discordJoin(w http.ResponseWriter, r *http.Request) {
 		for a.rooms[code] != nil {
 			code = roomCode()
 		}
-		game = &room{Code: code, Phase: "lobby", Library: "demo", Target: 5, Updated: time.Now()}
+		game = &room{Code: code, Phase: "lobby", Target: 5, Updated: time.Now()}
 		a.rooms[code] = game
 		a.instances[input.InstanceID] = code
 	}

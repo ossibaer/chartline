@@ -94,12 +94,12 @@ export class Playback {
       const response = await fetch(endpoint(`api/audio/${id}`), {
         headers: { Authorization: `Bearer ${this.token()}` }, signal: this.abort.signal,
       });
-      if (!response.ok) throw new Error('The clip could not be downloaded.');
+      if (!response.ok) throw new Error('The song could not be downloaded.');
       const data = await response.arrayBuffer();
       if (serial !== this.loadSerial) return;
       const buffer = await this.context().decodeAudioData(data);
       if (serial !== this.loadSerial || this.round?.id !== id) return;
-      if (this.round.offset >= buffer.duration) throw new Error('This clip starts after the song ends. Ask the host to skip it.');
+      if (this.round.offset >= buffer.duration) throw new Error('Playback starts after the song ends. Ask the host to skip it.');
       this.buffer = buffer;
       this.status = 'ready';
       this.ready();
@@ -107,7 +107,7 @@ export class Playback {
     } catch (error) {
       if (serial !== this.loadSerial) return;
       this.status = 'error';
-      this.error = error.name === 'AbortError' ? 'The clip took too long to load. Try again.' : error.message || 'This MP3 could not be decoded.';
+      this.error = error.name === 'AbortError' ? 'The song took too long to load. Try again.' : error.message || 'This MP3 could not be decoded.';
     } finally {
       clearTimeout(timeout);
       this.changed();
@@ -127,13 +127,12 @@ export class Playback {
     const delay = (round.startAt - this.now()) / 1000;
     const elapsed = Math.max(0, -delay);
     const offset = round.offset + elapsed;
-    const duration = Math.min(round.duration - elapsed, this.buffer.duration - offset);
-    if (duration <= 0) { this.status = 'ended'; this.changed(); return; }
+    if (offset >= this.buffer.duration) { this.status = 'ended'; this.changed(); return; }
     const source = this.ctx.createBufferSource();
     source.buffer = this.buffer;
     source.connect(this.gain);
     source.onended = () => { if (this.source === source) { this.status = 'ended'; this.changed(); } };
-    source.start(this.ctx.currentTime + Math.max(0, delay), offset, duration);
+    source.start(this.ctx.currentTime + Math.max(0, delay), offset);
     this.source = source;
     this.scheduled = key;
     this.status = 'playing';

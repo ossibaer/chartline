@@ -1,20 +1,16 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
 	"io/fs"
-	"log"
-	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,7 +37,6 @@ type app struct {
 	tickets      map[string]discordTicket
 	instances    map[string]string
 	library      []track
-	demos        []track
 	dataDir      string
 	assets       fs.FS
 	accessKey    string
@@ -54,7 +49,7 @@ func newApp(dir string, assets fs.FS) (*app, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &app{rooms: map[string]*room{}, sessions: map[string]session{}, tickets: map[string]discordTicket{}, instances: map[string]string{}, library: library, demos: demoLibrary(), dataDir: dir, assets: assets}, nil
+	return &app{rooms: map[string]*room{}, sessions: map[string]session{}, tickets: map[string]discordTicket{}, instances: map[string]string{}, library: library, dataDir: dir, assets: assets}, nil
 }
 
 func (a *app) handler() http.Handler {
@@ -63,8 +58,6 @@ func (a *app) handler() http.Handler {
 	mux.HandleFunc("POST /api/rooms", a.createRoom)
 	mux.HandleFunc("POST /api/join", a.joinRoom)
 	mux.HandleFunc("POST /api/leave", a.leaveRoom)
-	mux.HandleFunc("GET /api/library", a.listLibrary)
-	mux.HandleFunc("POST /api/library", a.uploadTrack)
 	mux.HandleFunc("GET /api/audio/{round}", a.audio)
 	mux.HandleFunc("POST /api/discord/token", a.discordToken)
 	mux.HandleFunc("POST /api/discord/join", a.discordJoin)
@@ -128,24 +121,16 @@ func cleanName(name string) string {
 func (a *app) validKey(key string) bool {
 	return a.accessKey == "" || subtle.ConstantTimeCompare([]byte(key), []byte(a.accessKey)) == 1
 }
-func (a *app) tracks(r *room) []track {
-	if r.Library == "custom" {
-		return a.library
-	}
-	return a.demos
-}
-
 func (a *app) config(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	count := len(a.library)
 	a.mu.Unlock()
-	writeJSON(w, 200, map[string]any{"customTrackCount": count, "demoTrackCount": len(a.demos), "accessKeyRequired": a.accessKey != "", "discordClientId": a.discord.ClientID, "discordEnabled": a.discord.ClientID != "" && a.discord.Secret != ""})
+	writeJSON(w, 200, map[string]any{"trackCount": count, "accessKeyRequired": a.accessKey != "", "discordClientId": a.discord.ClientID, "discordEnabled": a.discord.ClientID != "" && a.discord.Secret != ""})
 }
 
 type entryRequest struct {
 	Name      string `json:"name"`
 	Code      string `json:"code"`
-	Library   string `json:"library"`
 	Target    int    `json:"target"`
 	AccessKey string `json:"accessKey"`
 }
@@ -172,9 +157,6 @@ func (a *app) enter(w http.ResponseWriter, r *http.Request, create bool) {
 			fail(w, 503, "The server is full. Try again later.")
 			return
 		}
-		if input.Library != "custom" {
-			input.Library = "demo"
-		}
 		if input.Target != 5 && input.Target != 7 && input.Target != 10 {
 			input.Target = 5
 		}
@@ -182,7 +164,7 @@ func (a *app) enter(w http.ResponseWriter, r *http.Request, create bool) {
 		for a.rooms[code] != nil {
 			code = roomCode()
 		}
-		game = &room{Code: code, Phase: "lobby", Library: input.Library, Target: input.Target, Updated: time.Now()}
+		game = &room{Code: code, Phase: "lobby", Target: input.Target, Updated: time.Now()}
 		a.rooms[code] = game
 	} else {
 		game = a.rooms[strings.ToUpper(strings.TrimSpace(input.Code))]
@@ -276,7 +258,7 @@ func (a *app) reassignHost(r *room) {
 
 func (a *app) broadcast(r *room) {
 	r.Updated = time.Now()
-	message, _ := json.Marshal(map[string]any{"type": "state", "room": r.view(len(a.tracks(r))), "serverTime": time.Now().UnixMilli()})
+	message, _ := json.Marshal(map[string]any{"type": "state", "room": r.view(len(a.library)), "serverTime": time.Now().UnixMilli()})
 	for _, p := range r.Players {
 		if p.Client != nil {
 			p.Client.enqueue(message)
@@ -298,7 +280,6 @@ type action struct {
 	RoundID    string `json:"roundId,omitempty"`
 	Position   int    `json:"position"`
 	Generation int    `json:"generation,omitempty"`
-	Library    string `json:"library,omitempty"`
 	Target     int    `json:"target,omitempty"`
 	Team       string `json:"team"`
 	Artist     string `json:"artist,omitempty"`
@@ -429,19 +410,15 @@ func (a *app) applyAction(r *room, p *player, m action, now time.Time) error {
 		if !host || r.Phase != "lobby" {
 			return errors.New("Only the host can change lobby settings.")
 		}
-		if m.Library != "demo" && m.Library != "custom" {
-			return errors.New("Choose a song library.")
-		}
 		if m.Target != 5 && m.Target != 7 && m.Target != 10 {
 			return errors.New("Choose 5, 7 or 10 cards.")
 		}
-		r.Library = m.Library
 		r.Target = m.Target
 	case "start":
 		if !host {
 			return errors.New("The host starts the game.")
 		}
-		return r.start(a.tracks(r), now)
+		return r.start(a.library, now)
 	case "ready":
 		if r.Phase != "playing" || m.Generation != r.Round.Generation {
 			return nil
@@ -556,121 +533,6 @@ func (a *app) closeConnections() {
 	}
 }
 
-func (a *app) listLibrary(w http.ResponseWriter, r *http.Request) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	game, p := a.authenticate(bearer(r))
-	if p == nil {
-		fail(w, 401, "Your session has expired.")
-		return
-	}
-	if game.Phase != "lobby" || game.HostID != p.ID {
-		fail(w, 403, "The host can manage songs in the lobby.")
-		return
-	}
-	type libraryItem struct {
-		Title  string  `json:"title"`
-		Artist string  `json:"artist"`
-		Year   int     `json:"year"`
-		Start  float64 `json:"start"`
-	}
-	items := []libraryItem{}
-	for _, t := range a.library {
-		items = append(items, libraryItem{t.Title, t.Artist, t.Year, t.Start})
-	}
-	writeJSON(w, 200, items)
-}
-
-func (a *app) uploadTrack(w http.ResponseWriter, r *http.Request) {
-	a.mu.Lock()
-	game, p := a.authenticate(bearer(r))
-	allowed := p != nil && p.ID == game.HostID && game.Phase == "lobby"
-	a.mu.Unlock()
-	if !allowed {
-		fail(w, 403, "The host can upload songs in the lobby.")
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, 33<<20)
-	if err := r.ParseMultipartForm(1 << 20); err != nil {
-		fail(w, 400, "Choose an MP3 smaller than 32 MB.")
-		return
-	}
-	if r.MultipartForm != nil {
-		defer r.MultipartForm.RemoveAll()
-	}
-	title, artist := cleanName(r.FormValue("title")), cleanName(r.FormValue("artist"))
-	year, err := strconv.Atoi(r.FormValue("year"))
-	if err != nil || year < 1800 || year > time.Now().Year()+1 {
-		fail(w, 400, "Enter a valid release year.")
-		return
-	}
-	if title == "" || artist == "" || len([]rune(title)) > 100 || len([]rune(artist)) > 100 {
-		fail(w, 400, "Add a title and artist, up to 100 characters each.")
-		return
-	}
-	offset := 0.0
-	if value := r.FormValue("start"); value != "" {
-		offset, err = strconv.ParseFloat(value, 64)
-		if err != nil || math.IsNaN(offset) || math.IsInf(offset, 0) || offset < 0 || offset > 3600 {
-			fail(w, 400, "Clip start must be between 0 and 3600 seconds.")
-			return
-		}
-	}
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		fail(w, 400, "Choose an MP3 file.")
-		return
-	}
-	defer file.Close()
-	if !strings.EqualFold(filepath.Ext(header.Filename), ".mp3") {
-		fail(w, 400, "Choose an MP3 file.")
-		return
-	}
-	data, err := io.ReadAll(io.LimitReader(file, (32<<20)+1))
-	if err != nil || len(data) > 32<<20 {
-		fail(w, 400, "Choose an MP3 smaller than 32 MB.")
-		return
-	}
-	data, err = cleanMP3(data)
-	if err != nil {
-		fail(w, 400, err.Error())
-		return
-	}
-	t := track{ID: newID(), Title: title, Artist: artist, Year: year, Start: offset, Duration: 20}
-	t.File = t.ID + ".mp3"
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	game, p = a.authenticate(bearer(r))
-	if p == nil || p.ID != game.HostID || game.Phase != "lobby" {
-		fail(w, 409, "The lobby changed. Upload the song before starting a game.")
-		return
-	}
-	if len(a.library) >= 500 {
-		fail(w, 400, "The library limit is 500 songs.")
-		return
-	}
-	path := filepath.Join(a.dataDir, "audio", t.File)
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		log.Printf("save audio: %v", err)
-		fail(w, 500, "The song could not be saved.")
-		return
-	}
-	updated := append(append([]track{}, a.library...), t)
-	if err := saveLibrary(a.dataDir, updated); err != nil {
-		_ = os.Remove(path)
-		log.Printf("save library: %v", err)
-		fail(w, 500, "The library could not be saved.")
-		return
-	}
-	a.library = updated
-	for _, room := range a.rooms {
-		if room.Phase == "lobby" {
-			a.broadcast(room)
-		}
-	}
-	writeJSON(w, 201, map[string]any{"ok": true, "count": len(a.library)})
-}
-
 func (a *app) audio(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	game, p := a.authenticate(bearer(r))
@@ -688,17 +550,17 @@ func (a *app) audio(w http.ResponseWriter, r *http.Request) {
 	a.mu.Unlock()
 	w.Header().Set("Cache-Control", "private, no-store")
 	w.Header().Set("Content-Disposition", `inline; filename="clip"`)
-	if t.Demo > 0 {
-		w.Header().Set("Content-Type", "audio/wav")
-		http.ServeContent(w, r, "clip.wav", time.Time{}, bytes.NewReader(demoAudio(t.Demo)))
-		return
-	}
 	f, err := os.Open(filepath.Join(a.dataDir, "audio", t.File))
 	if err != nil {
 		fail(w, 404, "The MP3 could not be found. The host can skip this song.")
 		return
 	}
 	defer f.Close()
+	audio, err := mp3Audio(f)
+	if err != nil {
+		fail(w, 422, "The MP3 could not be played. The host can end this turn.")
+		return
+	}
 	w.Header().Set("Content-Type", "audio/mpeg")
-	http.ServeContent(w, r, "clip.mp3", time.Time{}, f)
+	http.ServeContent(w, r, "clip.mp3", time.Time{}, audio)
 }
