@@ -442,7 +442,7 @@ func TestLiveStealAndReconnect(t *testing.T) {
 			t.Fatal("clients disagreed on steal and independent token reward")
 		}
 	}
-	writeAction(t, c1, action{Type: "next", RoundID: playing.Room.Round.ID})
+	writeAction(t, reconnected, action{Type: "next", RoundID: playing.Room.Round.ID})
 	next := readUntil(t, reconnected, func(m wireMessage) bool { return m.Type == "state" && m.Room.Phase == "playing" })
 	a.mu.Lock()
 	r.Round.Track.Year = 1995

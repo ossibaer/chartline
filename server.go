@@ -258,9 +258,9 @@ func (a *app) reassignHost(r *room) {
 
 func (a *app) broadcast(r *room) {
 	r.Updated = time.Now()
-	message, _ := json.Marshal(map[string]any{"type": "state", "room": r.view(len(a.library)), "serverTime": time.Now().UnixMilli()})
 	for _, p := range r.Players {
 		if p.Client != nil {
+			message, _ := json.Marshal(map[string]any{"type": "state", "room": r.viewFor(len(a.library), p), "serverTime": time.Now().UnixMilli()})
 			p.Client.enqueue(message)
 		}
 	}
@@ -275,16 +275,18 @@ func (c *client) enqueue(message []byte) {
 func (c *client) message(value any) { data, _ := json.Marshal(value); c.enqueue(data) }
 
 type action struct {
-	Type       string `json:"type"`
-	Token      string `json:"token,omitempty"`
-	RoundID    string `json:"roundId,omitempty"`
-	Position   int    `json:"position"`
-	Generation int    `json:"generation,omitempty"`
-	Target     int    `json:"target,omitempty"`
-	Team       string `json:"team"`
-	Artist     string `json:"artist,omitempty"`
-	Title      string `json:"title,omitempty"`
-	ClientTime int64  `json:"clientTime,omitempty"`
+	Draft      *guessDraft `json:"draft,omitempty"`
+	DraftID    string      `json:"draftId,omitempty"`
+	Type       string      `json:"type"`
+	Token      string      `json:"token,omitempty"`
+	RoundID    string      `json:"roundId,omitempty"`
+	Position   int         `json:"position"`
+	Generation int         `json:"generation,omitempty"`
+	Target     int         `json:"target,omitempty"`
+	Team       string      `json:"team"`
+	Artist     string      `json:"artist,omitempty"`
+	Title      string      `json:"title,omitempty"`
+	ClientTime int64       `json:"clientTime,omitempty"`
 }
 
 func (a *app) socket(w http.ResponseWriter, r *http.Request) {
@@ -392,12 +394,14 @@ func (a *app) socket(w http.ResponseWriter, r *http.Request) {
 
 func (a *app) applyAction(r *room, p *player, m action, now time.Time) error {
 	host := p.ID == r.HostID
-	if m.Type == "ready" || m.Type == "place" || m.Type == "replay" || m.Type == "skip" || m.Type == "discard" || m.Type == "steal" || m.Type == "pass" || m.Type == "next" {
+	if m.Type == "draft" || m.Type == "ready" || m.Type == "place" || m.Type == "replay" || m.Type == "skip" || m.Type == "discard" || m.Type == "steal" || m.Type == "pass" || m.Type == "next" {
 		if r.Round == nil || r.Round.ID != m.RoundID {
 			return errors.New("The round changed. Try again.")
 		}
 	}
 	switch m.Type {
+	case "draft":
+		return r.editDraft(p, m.Draft, m.DraftID)
 	case "team":
 		if r.Phase != "lobby" {
 			return errors.New("Choose your team in the lobby before the game starts.")
@@ -446,8 +450,8 @@ func (a *app) applyAction(r *room, p *player, m action, now time.Time) error {
 		r.Round.Result = &resultView{Card: r.Round.Track.card(), Skipped: true, PlayerID: p.ID}
 		r.Phase = "reveal"
 	case "next":
-		if r.Phase != "reveal" || (!host && !r.isTurn(p)) {
-			return errors.New("Wait for the host or someone on the current timeline to continue.")
+		if !r.canContinue(p) {
+			return errors.New("Wait for the next team or solo player to start their song, or for the host or current team to show the results when the game is over.")
 		}
 		r.advance(now)
 	case "reset":

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -116,11 +117,17 @@ func TestTeamTurnsPermissionsAndOfflineMembers(t *testing.T) {
 	if err := a.applyAction(r, blue1, action{Type: "place", RoundID: r.Round.ID, Position: 2}, now); err == nil {
 		t.Fatal("a second teammate submitted the same round")
 	}
-	if err := a.applyAction(r, red, action{Type: "next", RoundID: r.Round.ID}, now); err == nil {
-		t.Fatal("opposing team advanced the round")
+	if err := a.applyAction(r, blue2, action{Type: "next", RoundID: r.Round.ID}, now); err == nil {
+		t.Fatal("previous team started the next team's song")
 	}
-	if err := a.applyAction(r, blue2, action{Type: "next", RoundID: r.Round.ID}, now); err != nil {
-		t.Fatal("teammate could not advance:", err)
+	if err := a.applyAction(r, solo, action{Type: "next", RoundID: r.Round.ID}, now); err == nil {
+		t.Fatal("host started another team's song")
+	}
+	if r.Phase != "reveal" || r.view(0).NextTurnID != "team-red" || r.schedule(now.Add(time.Minute)) {
+		t.Fatal("reveal did not wait for the next team")
+	}
+	if err := a.applyAction(r, red, action{Type: "next", RoundID: r.Round.ID}, now); err != nil {
+		t.Fatal("next team could not start its song:", err)
 	}
 	if r.currentTimeline().ID != "team-red" {
 		t.Fatal("red team did not get the next turn")
@@ -129,7 +136,14 @@ func TestTeamTurnsPermissionsAndOfflineMembers(t *testing.T) {
 		if err := a.applyAction(r, solo, action{Type: "discard", RoundID: r.Round.ID}, now); err != nil {
 			t.Fatal(err)
 		}
-		if err := a.applyAction(r, solo, action{Type: "next", RoundID: r.Round.ID}, now); err != nil {
+		if r.view(0).NextTurnID != want {
+			t.Fatalf("next team = %s, want %s", r.view(0).NextTurnID, want)
+		}
+		nextPlayer := solo
+		if want == "team-blue" {
+			nextPlayer = blue2
+		}
+		if err := a.applyAction(r, nextPlayer, action{Type: "next", RoundID: r.Round.ID}, now); err != nil {
 			t.Fatal(err)
 		}
 		if got := r.currentTimeline().ID; got != want {
@@ -215,6 +229,29 @@ func TestLiveTeamSelectionAndReconnect(t *testing.T) {
 	if len(playing.Room.Timelines[0].Cards) != 1 || playing.Room.TurnID != "team-green" {
 		t.Fatal("team did not start with one shared card")
 	}
+	positionDraft, artistDraft, titleDraft := 1, "Team artist", "Team title"
+	writeAction(t, c1, action{Type: "draft", RoundID: playing.Room.Round.ID, DraftID: "draft-one", Draft: &guessDraft{Position: &positionDraft, Artist: &artistDraft}})
+	shared := readUntil(t, c2, func(m wireMessage) bool {
+		return m.Type == "state" && m.Room.Draft != nil && m.Room.Draft.Artist != nil
+	})
+	if *shared.Room.Draft.Position != positionDraft || *shared.Room.Draft.Artist != artistDraft {
+		t.Fatal("teammate did not receive live draft")
+	}
+	writeAction(t, c2, action{Type: "draft", RoundID: playing.Room.Round.ID, DraftID: "draft-two", Draft: &guessDraft{Title: &titleDraft}})
+	shared = readUntil(t, c1, func(m wireMessage) bool { return m.Type == "state" && m.Room.Draft != nil && m.Room.Draft.Title != nil })
+	if *shared.Room.Draft.Title != titleDraft || *shared.Room.Draft.Artist != artistDraft {
+		t.Fatal("independent teammate edits were lost")
+	}
+	private := readUntil(t, c3, func(m wireMessage) bool { return m.Type == "state" && m.Room.Phase == "playing" })
+	if private.Room.Draft != nil {
+		t.Fatal("opponent received team draft")
+	}
+	c2.CloseNow()
+	c2 = connectTest(t, s, guest)
+	shared = readUntil(t, c2, func(m wireMessage) bool { return m.Type == "state" })
+	if shared.Room.Draft == nil || shared.Room.Draft.Title == nil || *shared.Room.Draft.Title != titleDraft || *shared.Room.Draft.Position != positionDraft {
+		t.Fatal("reconnect did not restore the shared draft")
+	}
 	writeAction(t, c2, action{Type: "team", Team: "red"})
 	readUntil(t, c2, func(m wireMessage) bool { return m.Type == "error" })
 	c1.CloseNow()
@@ -234,8 +271,74 @@ func TestLiveTeamSelectionAndReconnect(t *testing.T) {
 	if len(restored.Room.Players) != 3 || restored.Room.Players[0].Team != "green" || len(restored.Room.Timelines[0].Cards) != 2 || len(restored.Room.Timelines[0].PlayerIDs) != 2 {
 		t.Fatal("reconnect did not restore shared team state")
 	}
-	writeAction(t, reconnected, action{Type: "next", RoundID: playing.Room.Round.ID})
+	writeAction(t, c3, action{Type: "next", RoundID: playing.Room.Round.ID})
 	readUntil(t, c3, func(m wireMessage) bool {
 		return m.Type == "state" && m.Room.Phase == "playing" && m.Room.TurnID == solo.PlayerID
 	})
+}
+
+func TestTeamDraftUpdates(t *testing.T) {
+	now := time.Now()
+	a := &app{}
+	first := &player{ID: "first", Team: "blue", Client: &client{}}
+	teammate := &player{ID: "teammate", Team: "blue", Client: &client{}}
+	opponent := &player{ID: "opponent", Client: &client{}}
+	r := &room{Phase: "playing", Players: []*player{first, teammate, opponent}, Target: 10,
+		Round: &round{ID: "song", Track: track{Year: 1990}, StartAt: now.Add(-time.Second).UnixMilli()}}
+	r.Timelines = r.lobbyTimelines()
+	r.Timelines[0].Cards = []card{{Year: 1980}}
+	position, artist, title := 1, "An artist", "A title"
+	update := action{Type: "draft", RoundID: "song", DraftID: "first-edit", Draft: &guessDraft{Position: &position, Artist: &artist}}
+	if err := a.applyAction(r, first, update, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.applyAction(r, teammate, action{Type: "draft", RoundID: "song", DraftID: "second-edit", Draft: &guessDraft{Title: &title}}, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []*player{first, teammate} {
+		v := r.viewFor(0, p)
+		if v.Draft == nil || *v.Draft.Position != position || *v.Draft.Artist != artist || *v.Draft.Title != title {
+			t.Fatal("teammates did not share field updates")
+		}
+	}
+	if r.viewFor(0, opponent).Draft != nil || r.view(0).Draft != nil {
+		t.Fatal("draft leaked to opponents or public view")
+	}
+	if err := a.applyAction(r, opponent, update, now); err == nil {
+		t.Fatal("opponent edited team draft")
+	}
+	update.RoundID = "stale"
+	if err := a.applyAction(r, first, update, now); err == nil {
+		t.Fatal("stale draft accepted")
+	}
+	update.RoundID = "song"
+	invalid := 2
+	update.Draft = &guessDraft{Position: &invalid}
+	if err := a.applyAction(r, first, update, now); err == nil {
+		t.Fatal("invalid gap accepted")
+	}
+	long := strings.Repeat("x", 101)
+	update.Draft = &guessDraft{Artist: &long}
+	if err := a.applyAction(r, first, update, now); err == nil {
+		t.Fatal("oversized draft accepted")
+	}
+	empty := ""
+	update.Draft = &guessDraft{Artist: &empty}
+	if err := a.applyAction(r, teammate, update, now); err != nil {
+		t.Fatal(err)
+	}
+	if *r.Round.Draft.Artist != "" || *r.Round.Draft.Title != title {
+		t.Fatal("clearing artist overwrote title")
+	}
+	if err := r.place(teammate, position, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.applyAction(r, first, update, now); err == nil {
+		t.Fatal("draft changed after lock-in")
+	}
+	r.Deck = []track{{Year: 2000}}
+	r.nextRound(now)
+	if v := r.viewFor(0, first); v.Draft.Position != nil || v.Draft.Artist != nil || v.Draft.Title != nil {
+		t.Fatal("new song retained old draft")
+	}
 }

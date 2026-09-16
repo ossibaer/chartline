@@ -33,6 +33,7 @@ type player struct {
 	Team            string
 	Client          *client
 	ReadyGeneration int
+	DraftAck        string
 }
 
 // Each color shares one timeline; a player without a color has their own.
@@ -77,6 +78,7 @@ func teamName(color string) string {
 }
 
 type round struct {
+	Draft         guessDraft
 	ID            string
 	Track         track
 	Number        int
@@ -89,6 +91,41 @@ type round struct {
 	StealEligible []string
 	Steals        []stealView
 	Passed        []string
+}
+
+// Pointer fields let teammates edit one part without overwriting the others.
+type guessDraft struct {
+	Position *int    `json:"position,omitempty"`
+	Artist   *string `json:"artist,omitempty"`
+	Title    *string `json:"title,omitempty"`
+}
+
+func (r *room) editDraft(p *player, patch *guessDraft, id string) error {
+	if r.Phase != "playing" || !r.isTurn(p) {
+		return errors.New("Only the playing team can edit this guess.")
+	}
+	if patch == nil || id == "" || len(id) > 64 {
+		return errors.New("Invalid draft update.")
+	}
+	if patch.Position != nil && (*patch.Position < 0 || *patch.Position > len(r.currentTimeline().Cards)) {
+		return errors.New("Choose a gap in the timeline.")
+	}
+	for _, value := range []*string{patch.Artist, patch.Title} {
+		if value != nil && len([]rune(*value)) > 100 {
+			return errors.New("Keep the artist and title to 100 characters each.")
+		}
+	}
+	if patch.Position != nil {
+		r.Round.Draft.Position = patch.Position
+	}
+	if patch.Artist != nil {
+		r.Round.Draft.Artist = patch.Artist
+	}
+	if patch.Title != nil {
+		r.Round.Draft.Title = patch.Title
+	}
+	p.DraftAck = id
+	return nil
 }
 
 type lockedGuess struct {
@@ -323,17 +360,33 @@ func (r *room) lockGuess(p *player, position int, artist, title string, now time
 	return nil
 }
 
+func (r *room) nextTurn() int {
+	turn := r.Turn
+	for range r.Timelines {
+		turn = (turn + 1) % len(r.Timelines)
+		if r.Timelines[turn].online() {
+			break
+		}
+	}
+	return turn
+}
+
+func (r *room) canContinue(p *player) bool {
+	if r.Phase != "reveal" {
+		return false
+	}
+	if len(r.Winners) > 0 || len(r.Deck) == 0 {
+		return p.ID == r.HostID || r.isTurn(p)
+	}
+	return r.Timelines[r.nextTurn()].includes(p)
+}
+
 func (r *room) advance(now time.Time) {
 	if len(r.Winners) > 0 {
 		r.Phase = "finished"
 		return
 	}
-	for range r.Timelines {
-		r.Turn = (r.Turn + 1) % len(r.Timelines)
-		if r.Timelines[r.Turn].online() {
-			break
-		}
-	}
+	r.Turn = r.nextTurn()
 	r.nextRound(now)
 }
 
@@ -385,6 +438,8 @@ type roundView struct {
 }
 
 type roomView struct {
+	Draft        *guessDraft    `json:"draft,omitempty"`
+	DraftAck     string         `json:"draftAck,omitempty"`
 	Code         string         `json:"code"`
 	HostID       string         `json:"hostId"`
 	Players      []playerView   `json:"players"`
@@ -392,11 +447,22 @@ type roomView struct {
 	Phase        string         `json:"phase"`
 	Target       int            `json:"target"`
 	TurnID       string         `json:"turnId"`
+	NextTurnID   string         `json:"nextTurnId,omitempty"`
 	Round        *roundView     `json:"round,omitempty"`
 	TrackCount   int            `json:"trackCount"`
 	Remaining    int            `json:"remaining"`
 	Winners      []string       `json:"winners"`
 	FinishReason string         `json:"finishReason"`
+}
+
+func (r *room) viewFor(trackCount int, p *player) roomView {
+	v := r.view(trackCount)
+	if r.Phase == "playing" && r.Round != nil && r.isTurn(p) {
+		draft := r.Round.Draft
+		v.Draft = &draft
+		v.DraftAck = p.DraftAck
+	}
+	return v
 }
 
 func (r *room) view(trackCount int) roomView {
@@ -422,6 +488,9 @@ func (r *room) view(trackCount int) roomView {
 	}
 	if t := r.currentTimeline(); t != nil && r.Phase != "lobby" {
 		v.TurnID = t.ID
+		if r.Phase == "reveal" && len(r.Winners) == 0 && len(r.Deck) > 0 {
+			v.NextTurnID = r.Timelines[r.nextTurn()].ID
+		}
 	}
 	if r.Round != nil {
 		q := r.Round

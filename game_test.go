@@ -253,6 +253,8 @@ func TestLiveRoomAudioAndReconnect(t *testing.T) {
 		t.Fatal("clients did not see a correct reveal")
 	}
 	writeAction(t, c1, action{Type: "next", RoundID: roundID})
+	readUntil(t, c1, func(m wireMessage) bool { return m.Type == "error" })
+	writeAction(t, c2, action{Type: "next", RoundID: roundID})
 	next := readUntil(t, c2, func(m wireMessage) bool {
 		return m.Type == "state" && m.Room.Phase == "playing" && m.Room.TurnID == guest.PlayerID
 	})

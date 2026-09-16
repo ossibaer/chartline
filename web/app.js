@@ -6,6 +6,7 @@ const dialog = document.querySelector('#dialog');
 const params = new URLSearchParams(location.search);
 const state = { config: null, session: null, room: null, connected: false, tab: params.get('room') ? 'join' : 'create', selected: null, artistGuess: '', titleGuess: '', error: '', loading: false, offset: 0, bestRTT: Infinity };
 let ws, reconnectTimer, toastTimer, heartbeat, intentionalClose = false;
+let draftTimer, draftPatch = {}, pendingDrafts = [];
 const icons = {
   arrow: '<path d="M5 12h14m-5-5 5 5-5 5"/>',
   play: '<path d="m9 5 11 7-11 7Z"/>',
@@ -94,13 +95,15 @@ function songStage() {
   if (room.phase === 'reveal') {
     const result = round.result, recipient = room.timelines.find(t => t.id === result.awardedTo);
     const stolen = recipient && recipient.id !== active.id;
-    return `<section class="song-stage reveal-stage ${result.correct || stolen ? 'reveal-correct' : 'reveal-miss'}"><div class="reveal-copy"><h2>${result.skipped ? 'Turn skipped' : stolen ? `${esc(recipient.name)} stole the card` : result.correct ? 'Correct placement' : 'Incorrect placement'}</h2><h3>${esc(result.card.title)}</h3><p>${esc(result.card.artist)}</p>${!result.skipped ? `<p class="token-result ${result.tokenEarned ? 'token-earned' : ''}">${result.tokenEarned ? `+1 token for ${esc(active.name)}` : 'No token earned'}</p>` : ''}<button class="button button-dark" data-action="next" ${!isHost() && !myTurn() ? 'disabled' : ''}>${room.winners?.length ? 'Results' : 'Next turn'}</button></div><div class="reveal-year"><strong>${result.card.year}</strong></div></section>`;
+    const next = room.timelines.find(t => t.id === room.nextTurnId);
+    const canContinue = next ? belongsToMe(next) : isHost() || myTurn();
+    return `<section class="song-stage reveal-stage ${result.correct || stolen ? 'reveal-correct' : 'reveal-miss'}"><div class="reveal-copy"><h2>${result.skipped ? 'Turn skipped' : stolen ? `${esc(recipient.name)} stole the card` : result.correct ? 'Correct placement' : 'Incorrect placement'}</h2><h3>${esc(result.card.title)}</h3><p>${esc(result.card.artist)}</p>${!result.skipped ? `<p class="token-result ${result.tokenEarned ? 'token-earned' : ''}">${result.tokenEarned ? `+1 token for ${esc(active.name)}` : 'No token earned'}</p>` : ''}<p>${next ? `${esc(next.name)} is up next.` : 'Game complete.'}</p><button class="button button-dark" data-action="next" ${!state.connected || !canContinue ? 'disabled' : ''}>${next ? canContinue ? 'Play next song' : `Waiting for ${esc(next.name)}` : 'Results'}</button></div><div class="reveal-year"><strong>${result.card.year}</strong></div></section>`;
   }
   return `<section class="song-stage"><div class="audio-status"><span id="playback-label">Loading audio…</span><span id="playback-time">0:00</span></div><div class="audio-progress" role="presentation"><div id="audio-progress-fill"></div></div><div class="audio-actions"><button class="button button-outline" data-action="replay" ${!isHost() && !myTurn() ? 'disabled' : ''}>Replay</button>${myTurn() ? `<button class="button button-outline" data-action="skip" ${active.tokens < 2 || !room.remaining || !state.connected ? 'disabled' : ''} title="Spend 2 tokens to replace the song and keep your turn">Skip · 2 tokens</button>` : ''}${isHost() ? '<button class="text-button host-discard" data-action="discard" title="Host control for broken clips or disconnected players. Gives up this turn without awarding a card or token.">End turn</button>' : ''}<button class="text-button" data-action="retry-audio" id="retry-audio" hidden>Retry audio</button></div><p id="audio-error" class="form-error" role="status"></p></section>`;
 }
 
 function recognitionForm() {
-  return `<form id="recognition-form" class="recognition-form" aria-labelledby="recognition-title"><h3 id="recognition-title">Song guess <span class="muted">(optional)</span></h3><p class="muted">Match the artist and title at least 80% to earn 1 token, even if the card is misplaced.</p><div class="form-grid"><label class="field">Artist<input id="guess-artist" maxlength="100" autocomplete="off" value="${esc(state.artistGuess)}"></label><label class="field">Song title<input id="guess-title" maxlength="100" autocomplete="off" value="${esc(state.titleGuess)}"></label></div></form>`;
+  return `<form id="recognition-form" class="recognition-form" aria-labelledby="recognition-title"><h3 id="recognition-title">Song guess <span class="muted">(optional)</span></h3><p class="muted">Your placement and guesses are shared with your teammates. Match the artist and title at least 80% to earn 1 token, even if the card is misplaced.</p><div class="form-grid"><label class="field">Artist<input id="guess-artist" maxlength="100" autocomplete="off" value="${esc(state.artistGuess)}"></label><label class="field">Song title<input id="guess-title" maxlength="100" autocomplete="off" value="${esc(state.titleGuess)}"></label></div></form>`;
 }
 
 function timeline() {
@@ -206,6 +209,8 @@ function connect() {
       if (state.bestRTT === Infinity) state.offset = message.serverTime - Date.now();
       if (oldRound !== state.room.round?.id) { state.selected = null; state.artistGuess = ''; state.titleGuess = ''; }
       if (oldPhase !== state.room.phase) state.selected = null;
+      if (oldRound !== state.room.round?.id || state.room.phase !== 'playing') clearDraftUpdates();
+      syncDraft();
       render();
       playback.sync(state.room);
     } else if (message.type === 'pong') {
@@ -217,6 +222,7 @@ function connect() {
     if (ws !== socket) return;
     clearInterval(heartbeat);
     state.connected = false;
+    clearDraftUpdates();
     if (intentionalClose) return;
     if (event.code === 1008) {
       playback.clear();
@@ -231,6 +237,38 @@ function connect() {
     reconnectTimer = setTimeout(connect, 1800);
   };
   socket.onerror = () => socket.close();
+}
+
+function clearDraftUpdates() {
+  clearTimeout(draftTimer);
+  draftPatch = {};
+  pendingDrafts = [];
+}
+
+function flushDraft() {
+  clearTimeout(draftTimer);
+  if (!Object.keys(draftPatch).length || !state.connected || state.room?.phase !== 'playing' || !myTurn()) return;
+  const update = { draftId: crypto.randomUUID(), draft: draftPatch };
+  draftPatch = {};
+  pendingDrafts.push(update);
+  send('draft', update);
+}
+
+function editDraft(field, value) {
+  if (!state.connected || state.room?.phase !== 'playing' || !myTurn()) return;
+  draftPatch[field] = value;
+  clearTimeout(draftTimer);
+  draftTimer = setTimeout(flushDraft, 120);
+}
+
+function syncDraft() {
+  if (!state.room.draft) return;
+  const acknowledged = pendingDrafts.findIndex(update => update.draftId === state.room.draftAck);
+  if (acknowledged >= 0) pendingDrafts.splice(0, acknowledged + 1);
+  const draft = Object.assign({}, state.room.draft, ...pendingDrafts.map(update => update.draft), draftPatch);
+  state.selected = draft.position ?? null;
+  state.artistGuess = draft.artist ?? '';
+  state.titleGuess = draft.title ?? '';
 }
 
 function send(type, payload = {}) {
@@ -283,7 +321,7 @@ function openHelp() {
 document.addEventListener('submit', event => {
   if (event.target.id === 'recognition-form') {
     event.preventDefault();
-    if (!document.querySelector('#lock-button')?.disabled) send('place', { position: state.selected, artist: state.artistGuess, title: state.titleGuess });
+    if (!document.querySelector('#lock-button')?.disabled) { flushDraft(); send('place', { position: state.selected, artist: state.artistGuess, title: state.titleGuess }); }
   }
   if (event.target.id === 'entry-form') { event.preventDefault(); enter(event.target); }
 });
@@ -304,13 +342,13 @@ document.addEventListener('click', async event => {
     try { await navigator.clipboard.writeText(text); toast(embedded ? 'Room code copied.' : 'Invitation copied. Send it to your friends.'); }
     catch { toast(`Your room code is ${state.room.code}`); }
   }
-  else if (action === 'gap') { state.selected = Number(button.dataset.position); render(); document.querySelector('.timeline-gap.selected')?.focus({ preventScroll: true }); }
+  else if (action === 'gap') { state.selected = Number(button.dataset.position); editDraft('position', state.selected); flushDraft(); render(); document.querySelector('.timeline-gap.selected')?.focus({ preventScroll: true }); }
   else if (action === 'steal') { if (canSteal() && state.selected !== null) send('steal', { position: state.selected }); }
-  else if (['start', 'next', 'reset', 'replay', 'skip', 'discard', 'pass'].includes(action)) { if (action === 'start' || action === 'replay') playback.enable(); send(action); }
+  else if (['start', 'next', 'reset', 'replay', 'skip', 'discard', 'pass'].includes(action)) { if (action === 'start' || action === 'next' || action === 'replay') playback.enable(); send(action); }
 });
 document.addEventListener('input', event => {
-  if (event.target.id === 'guess-artist') state.artistGuess = event.target.value;
-  if (event.target.id === 'guess-title') state.titleGuess = event.target.value;
+  if (event.target.id === 'guess-artist') { state.artistGuess = event.target.value; editDraft('artist', state.artistGuess); }
+  if (event.target.id === 'guess-title') { state.titleGuess = event.target.value; editDraft('title', state.titleGuess); }
   if (event.target.id === 'volume') playback.setVolume(Number(event.target.value) / 100);
 });
 document.addEventListener('change', event => {
