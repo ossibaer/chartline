@@ -2,6 +2,10 @@
 
 A private music timeline game with no fixed player limit. Play solo or form up to four teams: blue, red, green, and yellow. Go serves the game, WebSocket rooms and local MP3 library; the frontend uses browser JavaScript with no Node build step.
 
+**There will be no active maintenance of this project.** The game is intended for private use with trusted friends who are expected to play fairly and not cheat. There are no anti-cheat measures in place.
+
+Licensed under the [MIT License](LICENSE). No music recordings are included. Read the [legal information](LEGAL_INFO.md) for music rights, hosting responsibilities, and third-party notices before hosting or distributing the game.
+
 ## Run
 
 Requires Go 1.26.5 or newer:
